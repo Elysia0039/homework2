@@ -1,0 +1,159 @@
+commit ee0bd9dd30b000791eb05d9208c0b15d891f2dea (HEAD -> master)
+Author: WIN-2022060556N\Administrator <1485955973@qq.com>
+Date:   Fri May 26 14:28:01 2023 +0800
+
+    改动：1.图片裁剪旋转transform。2.改变resnet18最后一层全连接层使之output变为200维。3.处理测试集。4.改变超参数。
+
+diff --git a/main.py b/main.py
+index 488ad61..55d79e7 100644
+--- a/main.py
++++ b/main.py
+@@ -1,8 +1,5 @@
+ # 这是一个示例 Python 脚本。
+-
+-# 按 Shift+F10 执行或将其替换为您的代码。
+-# 按 双击 Shift 在所有地方搜索类、文件、工具窗口、操作和设置。
+-
++# 更改的点：1.图片裁剪旋转transform。2.改变resnet18最后一层全连接层使之output变为200维。3.处理测试集。4.改变超参数。
+ import argparse
+ import os
+ import random
+@@ -25,14 +22,16 @@ import torchvision.models as models
+ import torchvision.transforms as transforms
+ from torch.optim.lr_scheduler import StepLR
+ from torch.utils.data import Subset
++from torch.utils.tensorboard import SummaryWriter
+
++j=0
+ model_names = sorted(name for name in models.__dict__
+                      if name.islower() and not name.startswith("__")
+                      and callable(models.__dict__[name]))
+
+-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+-parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
+-                    help='path to dataset (default: imagenet)')
++parser = argparse.ArgumentParser(description='PyTorch Tiny-ImageNet Training')
++parser.add_argument('data', metavar='DIR', nargs='?', default='data',
++                    help='path to dataset (default: data)')
+ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
+                     choices=model_names,
+                     help='model architecture: ' +
+@@ -40,7 +39,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
+                          ' (default: resnet18)')
+ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                     help='number of data loading workers (default: 4)')
+-parser.add_argument('--epochs', default=90, type=int, metavar='N',
++parser.add_argument('--epochs', default=40, type=int, metavar='N',
+                     help='number of total epochs to run')
+ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                     help='manual epoch number (useful on restarts)')
+@@ -84,6 +83,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
+ parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
+
+ best_acc1 = 0
++writer = SummaryWriter()
+
+
+ def main():
+@@ -146,8 +146,19 @@ def main_worker(gpu, ngpus_per_node, args):
+         print("=> using pre-trained model '{}'".format(args.arch))
+         model = models.__dict__[args.arch](pretrained=True)
+     else:
+-        print("=> creating model '{}'".format(args.arch))
+-        model = models.__dict__[args.arch]()
++        # 加载预训练的ResNet-18模型
++        model = models.resnet18(pretrained=True)
++        # 获取模型的最后一层全连接层
++        num_features = model.fc.in_features
++
++        # 替换最后一层全连接层并设置输出维度为num_classes
++        num_classes = 200
++        model.fc = torch.nn.Linear(num_features, num_classes)
++
++
++        #初始化新的全连接层的权重
++        torch.nn.init.zeros_(model.fc.bias)
++
+
+     if not torch.cuda.is_available() and not torch.backends.mps.is_available():
+         print('using CPU, this will be slow')
+@@ -201,7 +212,7 @@ def main_worker(gpu, ngpus_per_node, args):
+                                 weight_decay=args.weight_decay)
+
+     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
++    scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
+
+     # optionally resume from a checkpoint
+     if args.resume:
+@@ -229,8 +240,8 @@ def main_worker(gpu, ngpus_per_node, args):
+     # Data loading code
+     if args.dummy:
+         print("=> Dummy data is used!")
+-        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
+-        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
++        train_dataset = datasets.FakeData(1000000, (3, 64, 64), 200, transforms.ToTensor())
++        val_dataset = datasets.FakeData(50000, (3, 64, 64), 200, transforms.ToTensor())
+     else:
+         traindir = os.path.join(args.data, 'train')
+         valdir = os.path.join(args.data, 'val')
+@@ -240,17 +251,18 @@ def main_worker(gpu, ngpus_per_node, args):
+         train_dataset = datasets.ImageFolder(
+             traindir,
+             transforms.Compose([
+-                transforms.RandomResizedCrop(224),
+                 transforms.RandomHorizontalFlip(),
++                transforms.RandomCrop(64, padding=8),
++                transforms.RandomRotation(15),
++                transforms.RandomResizedCrop(64, scale=(0.8, 1.0)),
+                 transforms.ToTensor(),
+-                normalize,
++                transforms.Normalize(mean=[0.485, 0.456, 0.406],
++                                     std=[0.229, 0.224, 0.225])
+             ]))
+
+         val_dataset = datasets.ImageFolder(
+             valdir,
+             transforms.Compose([
+-                transforms.Resize(256),
+-                transforms.CenterCrop(224),
+                 transforms.ToTensor(),
+                 normalize,
+             ]))
+@@ -346,9 +358,15 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
+
+         if i % args.print_freq == 0:
+             progress.display(i + 1)
++        if epoch == args.start_epoch:
++            writer.add_graph(model, input_to_model=torch.randn(1, 3, 64, 64).to(device))
++        writer.add_scalar('Train/Loss', loss.item(), epoch)
++        writer.add_scalar('Train/Accuracy@1', acc1[0], epoch)
++        writer.add_scalar('Train/Accuracy@5', acc5[0], epoch)
+
+
+ def validate(val_loader, model, criterion, args):
++    global j
+     def run_validate(loader, base_progress=0):
+         with torch.no_grad():
+             end = time.time()
+@@ -405,6 +423,10 @@ def validate(val_loader, model, criterion, args):
+         run_validate(aux_val_loader, len(val_loader))
+
+     progress.display_summary()
++    writer.add_scalar('Validation/Loss', losses.avg, j)
++    writer.add_scalar('Validation/Accuracy@1', top1.avg, j)
++    writer.add_scalar('Validation/Accuracy@5', top5.avg, j)
++    j += 1
+
+     return top1.avg
+
+@@ -515,4 +537,5 @@ def accuracy(output, target, topk=(1,)):
+
+
+ if __name__ == '__main__':
+-    main()
+\ No newline at end of file
++    main()
++writer.close()
+\ No newline at end of file
+(END)
